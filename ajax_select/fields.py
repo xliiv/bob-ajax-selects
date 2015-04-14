@@ -15,6 +15,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.urlresolvers import reverse
 from django.forms.util import flatatt
+from django.template import Context, Template
 from django.template.defaultfilters import escapejs
 from django.template.loader import render_to_string
 from django.utils.safestring import mark_safe
@@ -25,7 +26,8 @@ from django.utils import simplejson
 
 as_default_help = u'Enter text to search.'
 
-####################################################################################
+
+###############################################################################
 
 class AutoCompleteSelectWidget(forms.widgets.TextInput):
 
@@ -89,7 +91,6 @@ class AutoCompleteSelectWidget(forms.widgets.TextInput):
             'add_link': self.add_link,
         }
         context.update(plugin_options(lookup,self.channel,self.plugin_options,initial))
-        context.update(bootstrap())
 
         return mark_safe(render_to_string(('autocompleteselect_%s.html' % self.channel[1], 'autocompleteselect.html'),context))
 
@@ -117,11 +118,12 @@ class AutoCompleteSelectField(forms.fields.CharField):
             widget_kwargs = dict(
                 channel = channel,
                 help_text = kwargs.get('help_text',_(as_default_help)),
-                show_help_text = kwargs.pop('show_help_text',True),
-                plugin_options = kwargs.pop('plugin_options',{})
+                show_help_text = kwargs.pop('show_help_text', True),
+                plugin_options = kwargs.pop('plugin_options', {}),
+                attrs = kwargs.pop('attrs', {}),
             )
             kwargs["widget"] = AutoCompleteSelectWidget(**widget_kwargs)
-        super(AutoCompleteSelectField, self).__init__(max_length=255,*args, **kwargs)
+        super(AutoCompleteSelectField, self).__init__(max_length=255, *args, **kwargs)
 
     def clean(self, value):
         if value:
@@ -142,8 +144,132 @@ class AutoCompleteSelectField(forms.fields.CharField):
         _check_can_add(self,user,model)
 
 
-####################################################################################
+###############################################################################
 
+class AutoCompleteCascadeSelectField(AutoCompleteSelectField):
+    """An extension of AutoCompleteSelectField, which allows selecting values
+    depending on the value present in another AutoCompleteSelectField
+    ('cascading selects').
+    In order to use it, you have to specify two things:
+    1. 'parent_field', which is a constructor's parameter pointing to the
+       actual field (i.e. its object);
+    2. parent widget's id, which should be specified through the attrs on the
+       *parent* field (e.g. attrs={'id': 'id_parent_field'}) - this id will be
+       available here as parent_field_widget_id.
+    And also, this field should be used together with CascadeLookupChannel.
+    Example usage:
+
+    phone_model = AutoCompleteCascadeSelectField(
+        ('phoneapp.channels', 'PhoneModelLookup'),
+        required=True,  # optional
+        label=_('Phone model'),
+        # 'parent_field' should be an instance of AutoCompleteSelectField
+        parent_field=phone_manufacturer,
+     )
+    """
+    def __init__(self, channel, *args, **kwargs):
+        if 'parent_field' in kwargs:
+            parent_field = kwargs.pop('parent_field')
+            parent_field_widget_id = parent_field.widget.attrs.get('id')
+            attrs = kwargs.pop('attrs', {})
+            attrs.update({'data-parent-id': parent_field_widget_id})
+            widget_kwargs = dict(
+                channel=channel,
+                help_text=kwargs.get('help_text', _(as_default_help)),
+                show_help_text=kwargs.pop('show_help_text', True),
+                plugin_options=kwargs.pop('plugin_options', {}),
+                attrs=attrs,
+            )
+            kwargs['widget'] = AutoCompleteSelectWidget(**widget_kwargs)
+        super(AutoCompleteCascadeSelectField, self).__init__(channel, *args,
+                                                             **kwargs)
+
+
+###############################################################################
+
+class CascadeSelect(forms.Select):
+    """A slightly modified version of forms.Select - added generation of
+    'data-channel' attribute based on the 'channel' value passed to init
+    and base URL where lookups should be attached ('ajax_lookup').
+    """
+    def __init__(self, channel, attrs=None, choices=()):
+        super(CascadeSelect, self).__init__(attrs, choices)
+        self.channel = channel
+
+    def render(self, name, value, attrs=None, choices=()):
+        t = Template('{% url ajax_lookup channel %}')
+        c = Context({'channel': self.channel})
+        channel = t.render(c)
+        attrs.update({'data-channel': channel})
+        if value is None:
+            value = ''
+        final_attrs = self.build_attrs(attrs, name=name)
+        output = [u'<select%s>' % flatatt(final_attrs)]
+        options = self.render_options(choices, [value])
+        if options:
+            output.append(options)
+        output.append(u'</select>')
+        return mark_safe(u'\n'.join(output))
+
+
+class CascadeModelChoiceField(forms.ModelChoiceField):
+    """An extension of ModelChoiceField adjusted for cascading selects in a
+    similar fashion as AutoCompleteCascadeSelectField. Example usage:
+
+    phone_model = CascadeModelChoiceField(
+        ('phoneapp.channels', 'PhoneModelLookup'),
+        label=_('Phone model'),
+        queryset=PhoneModel.objects.all(),
+        # 'parent_field' should be an instance of:
+        # AutoCompleteSelectField or ModelChoiceField
+        parent_field=phone_manufacturer,
+    )
+
+    In addition phone_manufacturer's widget ``id`` CAN be set, like::
+
+        phone_manufacturer = ModelChoiceField(
+            ..
+            widget=Select(attrs={'id': 'data-center-selection'}),
+            ..
+        )
+
+    or when using in formset id should be set in form dynamically, like below:
+
+        class UserForm(forms.ModelForm):
+            class Meta:
+                model = User
+                fields = ("country", "city")
+
+            country = AutoCompleteSelectField(
+                ('app.channels', 'CountryLookup'),
+            )
+            city = CascadeModelChoiceField(
+                ('app.channels', 'CityLookup'),
+                queryset=City.objects.all(),
+                parent_field=country,
+            )
+
+            def __init__(self, *args, **kwargs):
+                super(UserForm, self).__init__(*args, **kwargs)
+                self['city'].field.widget.attrs['data-parent-id'] = (
+                    self['country'].auto_id
+                )
+
+    """
+    def __init__(self, channel, *args, **kwargs):
+        if 'parent_field' in kwargs:
+            channel = cPickle.dumps(channel)
+            channel = base64.b64encode(channel)
+            parent_field = kwargs.pop('parent_field')
+            parent_field_widget_id = parent_field.widget.attrs.get('id')
+            widget_attrs = kwargs.pop('attrs', {})
+            if parent_field_widget_id:
+                widget_attrs.update({'data-parent-id': parent_field_widget_id})
+            kwargs['widget'] = CascadeSelect(channel, attrs=widget_attrs)
+        super(CascadeModelChoiceField, self).__init__(*args, **kwargs)
+
+
+###############################################################################
 
 class AutoCompleteSelectMultipleWidget(forms.widgets.SelectMultiple):
 
@@ -212,7 +338,6 @@ class AutoCompleteSelectMultipleWidget(forms.widgets.SelectMultiple):
             'add_link' : self.add_link,
         }
         context.update(plugin_options(lookup,self.channel,self.plugin_options,initial))
-        context.update(bootstrap())
 
         return mark_safe(render_to_string(('autocompleteselectmultiple_%s.html' % self.channel[1], 'autocompleteselectmultiple.html'),context))
 
@@ -288,8 +413,7 @@ class AutoCompleteSelectMultipleField(forms.fields.CharField):
         _check_can_add(self,user,model)
 
 
-####################################################################################
-
+###############################################################################
 
 class AutoCompleteWidget(forms.TextInput):
     """
@@ -330,7 +454,6 @@ class AutoCompleteWidget(forms.TextInput):
             'func_slug': self.html_id.replace("-",""),
         }
         context.update(plugin_options(lookup,self.channel,self.plugin_options,initial))
-        context.update(bootstrap())
 
         templates = ('autocomplete_%s.html' % self.channel[1],
                      'autocomplete.html')
@@ -363,7 +486,7 @@ class AutoCompleteField(forms.CharField):
         super(AutoCompleteField, self).__init__(*args, **defaults)
 
 
-####################################################################################
+###############################################################################
 
 def _check_can_add(self,user,model):
     """ check if the user can add the model, deferring first to
@@ -408,29 +531,8 @@ def plugin_options(channel,channel_name,widget_plugin_options,initial):
         channel = base64.b64encode(channel)
         po['source'] = reverse('ajax_lookup',kwargs={'channel': channel})
     return {
-        'plugin_options': mark_safe(simplejson.dumps(po)),
+        'plugin_options': simplejson.dumps(po),
         # continue to support any custom templates that still expect these
         'lookup_url': po['source'],
         'min_length': po['min_length']
         }
-
-
-def bootstrap():
-    b = {}
-    b['bootstrap'] = getattr(settings,'AJAX_SELECT_BOOTSTRAP',False)
-    inlines = getattr(settings,'AJAX_SELECT_INLINES',None)
-
-    b['inline'] = ''
-    if inlines == 'inline':
-        directory = os.path.dirname( os.path.realpath(__file__) )
-        f = open(os.path.join(directory,"static","css","ajax_select.css"))
-        css = f.read()
-        f = open(os.path.join(directory,"static","js","ajax_select.js"))
-        js = f.read()
-        b['inline'] = mark_safe(u"""<style type="text/css">%s</style><script type="text/javascript">//<![CDATA[%s//]]></script>""" % (css,js))
-    elif inlines == 'staticfiles':
-        b['inline'] = mark_safe("""<style type="text/css">@import url("%sajax_select/css/ajax_select.css");</style><script type="text/javascript" src="%sajax_select/js/ajax_select.js"></script>""" % (settings.STATIC_URL,settings.STATIC_URL))
-
-    return b
-
-
