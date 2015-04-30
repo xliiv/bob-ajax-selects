@@ -257,6 +257,16 @@ class CascadeModelChoiceField(forms.ModelChoiceField):
 
     """
     def __init__(self, channel, *args, **kwargs):
+        self.field_name_label = kwargs.pop('field_name_label', None)
+        model_fields = kwargs['queryset'].model._meta.get_all_field_names()
+        if (
+            self.field_name_label and self.field_name_label not in model_fields
+        ):
+            raise AttributeError(
+                "{model} has no field {field!r}".format(
+                    model=kwargs['queryset'].model, field=self.field_name_label,
+                )
+            )
         if 'parent_field' in kwargs:
             channel = cPickle.dumps(channel)
             channel = base64.b64encode(channel)
@@ -267,6 +277,17 @@ class CascadeModelChoiceField(forms.ModelChoiceField):
                 widget_attrs.update({'data-parent-id': parent_field_widget_id})
             kwargs['widget'] = CascadeSelect(channel, attrs=widget_attrs)
         super(CascadeModelChoiceField, self).__init__(*args, **kwargs)
+
+    def label_from_instance(self, obj):
+        """
+        Override standard method to control displaying field in choice field.
+        """
+        if self.field_name_label:
+            return getattr(obj, self.field_name_label)
+        else:
+            return super(CascadeModelChoiceField, self).label_from_instance(obj)
+
+
 
 
 ###############################################################################
